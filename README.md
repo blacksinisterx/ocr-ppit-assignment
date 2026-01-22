@@ -205,9 +205,7 @@ ocr-ppit-assignment/
 - Mathematical equations/symbols have limited support
 - Very small text (<10pt) may be difficult to read
 
-## 📄 License
 
-Free to use for personal and educational purposes.
 
 ## 🤝 Contributing
 
