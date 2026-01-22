@@ -1,0 +1,22 @@
+# OCR Image to Word App - Dependencies
+
+# Web Framework
+streamlit==1.31.0
+
+# OCR Engines
+easyocr==1.7.1
+paddlepaddle==3.3.0
+paddleocr==2.7.3
+transformers==4.36.0
+
+# Image Processing
+Pillow==10.2.0
+
+# Word Document Generation
+python-docx==1.1.0
+
+# Additional Dependencies (automatically installed with EasyOCR)
+# - torch (PyTorch for deep learning)
+# - opencv-python-headless (image processing)
+# - numpy (numerical operations)
+# - scipy (scientific computing)
