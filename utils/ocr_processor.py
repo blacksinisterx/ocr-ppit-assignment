@@ -8,6 +8,23 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 import io
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+# Fix for PaddleOCR crash on some Windows systems (fused_conv2d error)
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ['FLAGS_enable_mkldnn'] = '0'
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+
 
 class OCRProcessor:
     """Handle OCR operations for image-to-text conversion"""
@@ -26,6 +43,33 @@ class OCRProcessor:
         self.languages = languages
         self.gpu = gpu
         self.processor = None  # For TrOCR
+        self.use_tesseract = False
+        
+        # Check if Tesseract is available
+        if pytesseract:
+            # Smart Tesseract Path Auto-detection
+            tesseract_in_path = False
+            try:
+                # Actual check if binary is available/callable
+                pytesseract.get_tesseract_version()
+                tesseract_in_path = True
+            except Exception:
+                pass
+                
+            if not tesseract_in_path:
+                import os
+                common_paths = [
+                    r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                    os.path.expanduser(r'~\AppData\Local\Tesseract-OCR\tesseract.exe')
+                ]
+                for path in common_paths:
+                    if os.path.exists(path):
+                        pytesseract.pytesseract.tesseract_cmd = path
+                        tesseract_in_path = True
+                        break
+            
+            self.use_tesseract = tesseract_in_path
     
     def initialize_reader(self):
         """
@@ -38,16 +82,23 @@ class OCRProcessor:
                 self.reader = easyocr.Reader(self.languages, gpu=self.gpu)
             
             elif self.engine == 'paddleocr':
-                from paddleocr import PaddleOCR
-                lang = self.languages[0] if self.languages else 'en'
-                self.reader = PaddleOCR(
-                    use_angle_cls=True, 
-                    lang=lang, 
-                    use_gpu=self.gpu, 
-                    show_log=False,
-                    det_db_box_thresh=0.3,
-                    det_db_unclip_ratio=2.0
-                )
+                try:
+                    from paddleocr import PaddleOCR
+                    import logging
+                    # Suppress Paddle logging
+                    logging.getLogger('ppocr').setLevel(logging.ERROR)
+                    
+                    lang = self.languages[0] if self.languages else 'en'
+                    self.reader = PaddleOCR(
+                        use_angle_cls=True, 
+                        lang=lang
+                        # Removed extra params (det_db_box_thresh, det_db_unclip_ratio) due to internal Paddle errors
+                    )
+                except Exception as e:
+                    print(f"PaddleOCR failed to initialize: {e}")
+                    self.reader = None
+                    # We might want to switch engine here or handle in caller
+                    raise ImportError(f"PaddleOCR init failed: {e}")
             
             elif self.engine == 'trocr':
                 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -61,43 +112,77 @@ class OCRProcessor:
         
         return self.reader
     
-    def preprocess_image(self, image, enhance=True):
+    def preprocess_image(self, image, enhance=True, advanced=True):
         """
         Preprocess image for better OCR accuracy
         
         Args:
             image: PIL Image object
-            enhance: Whether to apply enhancement (default: True)
+            enhance: Whether to apply basic enhancement (default: True)
+            advanced: Whether to use advanced OpenCV preprocessing (default: True)
             
         Returns:
             numpy array of processed image
         """
+        # Convert PIL to numpy if needed
+        if isinstance(image, Image.Image):
+            img_array = np.array(image.convert('RGB'))
+        else:
+            img_array = image
+            
+        if advanced and cv2 is not None:
+            # Convert to grayscale
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            
+            # Apply Gaussian Blur to remove noise
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # Adaptive Thresholding to binarize
+            # This handles varying lighting conditions better than global threshold
+            thresh = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # Denoise
+            denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
+            
+            # Convert back to RGB format for consistency
+            processed_img = cv2.cvtColor(denoised, cv2.COLOR_GRAY2RGB)
+            return processed_img
+            
+        # Fallback to basic PIL enhancement if OpenCV not available or advanced=False
+        if isinstance(image, np.ndarray):
+            pil_image = Image.fromarray(image)
+        else:
+            pil_image = image
+            
         # Convert to RGB if needed
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
         
         # Optional enhancement for better OCR
         if enhance:
             # Increase contrast
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(1.5)
+            enhancer = ImageEnhance.Contrast(pil_image)
+            pil_image = enhancer.enhance(1.5)
             
             # Increase sharpness
-            enhancer = ImageEnhance.Sharpness(image)
-            image = enhancer.enhance(1.3)
+            enhancer = ImageEnhance.Sharpness(pil_image)
+            pil_image = enhancer.enhance(1.3)
         
         # Convert PIL Image to numpy array
-        img_array = np.array(image)
+        img_array = np.array(pil_image)
         
         return img_array
     
-    def extract_text(self, image, detail=0):
+    def extract_text(self, image, detail=0, advanced_preprocess=True):
         """
         Extract text from image using selected OCR engine
         
         Args:
             image: PIL Image object or file path
             detail: 0 = text only, 1 = text with confidence, 2 = full details
+            advanced_preprocess: Whether to use advanced OpenCV preprocessing
             
         Returns:
             Extracted text as string or detailed results
@@ -108,7 +193,7 @@ class OCRProcessor:
         
         # Handle PIL Image
         if isinstance(image, Image.Image):
-            img_array = self.preprocess_image(image)
+            img_array = self.preprocess_image(image, advanced=advanced_preprocess)
             pil_image = image
         else:
             img_array = image
@@ -127,7 +212,7 @@ class OCRProcessor:
                 return results
         
         elif self.engine == 'paddleocr':
-            results = self.reader.ocr(img_array, cls=True)
+            results = self.reader.ocr(img_array)
             
             if not results or not results[0]:
                 return "" if detail == 0 else []
@@ -144,6 +229,18 @@ class OCRProcessor:
         elif self.engine == 'trocr':
             # Use EasyOCR to detect text regions, TrOCR to recognize
             return self._extract_with_trocr(pil_image, img_array)
+            
+        elif self.engine == 'tesseract':
+            if pytesseract:
+                try:
+                    return pytesseract.image_to_string(pil_image).strip()
+                except Exception as e:
+                    # print(f"Tesseract simple extraction failed: {e}")
+                    return ""
+            else:
+                return ""
+        
+        return ""
     
     def _extract_with_trocr(self, pil_image, img_array):
         """Extract text using TrOCR with EasyOCR for detection"""
@@ -205,7 +302,7 @@ class OCRProcessor:
             text_items = [(bbox, text, conf) for bbox, text, conf in sorted_results]
         
         elif self.engine == 'paddleocr':
-            results = self.reader.ocr(img_array, cls=True)
+            results = self.reader.ocr(img_array)
             if not results or not results[0]:
                 return ""
             sorted_results = sorted(results[0], key=lambda x: x[0][0][1] if x and len(x) > 0 else 0)
@@ -245,21 +342,22 @@ class OCRProcessor:
         # Join lines with newlines
         return '\n'.join(lines)
     
-    def get_confidence_score(self, image):
+    def get_confidence_score(self, image, advanced_preprocess=True):
         """
         Get average confidence score for OCR results
         
         Args:
             image: PIL Image object
+            advanced_preprocess: Whether to use advanced OpenCV preprocessing
             
         Returns:
             Average confidence score (0-1)
         """
-        if self.reader is None:
+        if self.reader is None and self.engine != 'tesseract':
             self.initialize_reader()
         
         # TrOCR doesn't provide confidence scores
-        img_array = self.preprocess_image(image)
+        img_array = self.preprocess_image(image, advanced=advanced_preprocess)
         
         if self.engine == 'easyocr':
             results = self.reader.readtext(img_array)
@@ -269,11 +367,78 @@ class OCRProcessor:
             return sum(confidences) / len(confidences)
         
         elif self.engine == 'paddleocr':
-            results = self.reader.ocr(img_array, cls=True)
+            results = self.reader.ocr(img_array)
             if not results or not results[0]:
                 return 0.0
             confidences = [line[1][1] for line in results[0] if line and len(line) > 1]
             if not confidences:
                 return 0.0
         
+        elif self.engine == 'tesseract' and pytesseract:
+             try:
+                data = pytesseract.image_to_data(img_array, output_type=pytesseract.Output.DICT)
+                confidences = [float(conf) for conf in data['conf'] if conf != '-1']
+                if not confidences:
+                    return 0.0
+                return sum(confidences) / len(confidences) / 100.0
+             except:
+                 return 0.0
+                 
         return 0.0
+
+    def extract_text_with_formatting(self, image, advanced_preprocess=True):
+        """
+        Extract text with formatting attributes using Tesseract
+        
+        Args:
+            image: PIL Image object
+            advanced_preprocess: Whether to use advanced OpenCV preprocessing
+            
+        Returns:
+            List of dictionaries containing text and formatting data
+            or raw text if Tesseract unavailable
+        """
+        if not pytesseract:
+            return [{'text': self.extract_text(image, advanced_preprocess=advanced_preprocess), 'bold': False, 'italic': False, 'paragraph': 0}]
+            
+        img_array = self.preprocess_image(image, advanced=advanced_preprocess)
+        
+        try:
+            # Get verbose data including boxes, confidences, line and page numbers
+            data = pytesseract.image_to_data(img_array, output_type=pytesseract.Output.DICT)
+            
+            structured_data = []
+            curr_paragraph = 0
+            
+            # Tesseract structure:
+            # level: 1=page, 2=block, 3=para, 4=line, 5=word
+            
+            n_boxes = len(data['level'])
+            for i in range(n_boxes):
+                if data['level'][i] == 5:  # Word level
+                    text = data['text'][i].strip()
+                    if not text:
+                        continue
+                        
+                    # Basic font checks (Tesseract doesn't give bold/italic directly in standard mode
+                    # without hOCR, but we can infer some things or use osd)
+                    # For now, we'll store the structural info which is most reliable
+                    
+                    structured_data.append({
+                        'text': text,
+                        'block': data['block_num'][i],
+                        'para': data['par_num'][i],
+                        'line': data['line_num'][i],
+                        'left': data['left'][i],
+                        'top': data['top'][i],
+                        'width': data['width'][i],
+                        'height': data['height'][i],
+                        'conf': data['conf'][i]
+                    })
+            
+            return structured_data
+            
+        except Exception as e:
+            # print(f"Tesseract extraction failed: {e}") # Suppress noise
+            return [{'text': self.extract_text(image, advanced_preprocess=advanced_preprocess), 'bold': False, 'italic': False, 'paragraph': 0}]
+

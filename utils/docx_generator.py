@@ -175,10 +175,101 @@ class DocxGenerator:
         Returns:
             BytesIO if filename is None, else None (saves to file)
         """
-        generator = DocxGenerator()
-        generator.create_document(text)
+    def create_formatted_document(self, structured_data, title="OCR Extracted Text", confidence_score=None):
+        """
+        Create document with formatting preserved from structured data
         
-        if filename:
-            generator.save_to_file(filename)
-        else:
-            return generator.save_to_bytes()
+        Args:
+            structured_data: List of dicts with text and layout info
+            title: Document title
+            confidence_score: Overall confidence score
+            
+        Returns:
+            Document object
+        """
+        self.document = Document()
+        
+        # Add title
+        title_para = self.document.add_heading(title, level=0)
+        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Add metadata
+        meta = self.document.add_paragraph()
+        meta.add_run('Generated: ').bold = True
+        meta.add_run(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+        
+        if confidence_score is not None:
+            meta.add_run('OCR Confidence: ').bold = True
+            meta.add_run(f'{confidence_score*100:.1f}%\n')
+        
+        for run in meta.runs:
+            run.font.size = Pt(9)
+        
+        self.document.add_paragraph('_' * 80)
+        
+        # Process structured data
+        if not structured_data:
+            p = self.document.add_paragraph("No text detected in the image.")
+            p.italic = True
+            return self.document
+            
+        current_block = -1
+        current_para = -1
+        p = None
+        
+        # If simple text list (fallback)
+        if isinstance(structured_data[0], dict) and 'block' not in structured_data[0]:
+             self.document.add_paragraph(structured_data[0]['text'])
+             return self.document
+
+        # Provide a buffer for line construction
+        line_buffer = []
+        last_line_num = -1
+        
+        # Group by blocks and paragraphs
+        for item in structured_data:
+            block_num = item['block']
+            para_num = item['para']
+            line_num = item['line']
+            text = item['text']
+            
+            if block_num != current_block or para_num != current_para:
+                # Flush previous line if any
+                if line_buffer:
+                    if p is None:
+                         p = self.document.add_paragraph()
+                    
+                    # Add space before appending new text if not start of paragraph
+                    if len(p.runs) > 0:
+                        p.add_run(' ')
+                        
+                    run = p.add_run(' '.join(line_buffer))
+                    run.font.size = Pt(11)
+                    run.font.name = 'Calibri'
+                    line_buffer = []
+
+                # New paragraph
+                p = self.document.add_paragraph()
+                current_block = block_num
+                current_para = para_num
+                last_line_num = line_num
+                
+            elif line_num != last_line_num:
+                # New line in same paragraph -> add to buffer
+                if line_buffer:
+                     run = p.add_run(' '.join(line_buffer) + ' ')
+                     run.font.size = Pt(11)
+                     run.font.name = 'Calibri'
+                     line_buffer = []
+                last_line_num = line_num
+            
+            line_buffer.append(text)
+            
+        # Flush remaining buffer
+        if line_buffer and p is not None:
+            run = p.add_run(' '.join(line_buffer))
+            run.font.size = Pt(11)
+            run.font.name = 'Calibri'
+            
+        return self.document
+
